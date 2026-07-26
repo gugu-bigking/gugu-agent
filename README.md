@@ -1,7 +1,7 @@
 # 🧰 AI Agent Service Toolkit
 
-[![build status](https://github.com/JoshuaC215/agent-service-toolkit/actions/workflows/test.yml/badge.svg)](https://github.com/JoshuaC215/agent-service-toolkit/actions/workflows/test.yml) [![codecov](https://codecov.io/github/JoshuaC215/agent-service-toolkit/graph/badge.svg?token=5MTJSYWD05)](https://codecov.io/github/JoshuaC215/agent-service-toolkit) [![Python Version](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2FJoshuaC215%2Fagent-service-toolkit%2Frefs%2Fheads%2Fmain%2Fpyproject.toml)](https://github.com/JoshuaC215/agent-service-toolkit/blob/main/pyproject.toml)
-[![GitHub License](https://img.shields.io/github/license/JoshuaC215/agent-service-toolkit)](https://github.com/JoshuaC215/agent-service-toolkit/blob/main/LICENSE) [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_red.svg)](https://agent-service-toolkit.streamlit.app/)
+[![build status](https://github.com/gugu-bigking/gugu-agent/actions/workflows/test.yml/badge.svg)](https://github.com/gugu-bigking/gugu-agent/actions/workflows/test.yml) [![codecov](https://codecov.io/github/gugu-bigking/gugu-agent/graph/badge.svg?token=5MTJSYWD05)](https://codecov.io/github/gugu-bigking/gugu-agent) [![Python Version](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2Fgugu-bigking%2Fgugu-agent%2Frefs%2Fheads%2Fmain%2Fpyproject.toml)](https://github.com/gugu-bigking/gugu-agent/blob/main/pyproject.toml)
+[![GitHub License](https://img.shields.io/github/license/gugu-bigking/gugu-agent)](https://github.com/gugu-bigking/gugu-agent/blob/main/LICENSE) [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_red.svg)](http://localhost:8501)
 
 A full toolkit for running an AI agent service built with LangGraph, FastAPI and Streamlit.
 
@@ -82,7 +82,7 @@ The repository is structured as follows:
 1. Clone the repository:
 
    ```sh
-   git clone https://github.com/JoshuaC215/agent-service-toolkit.git
+   git clone https://github.com/gugu-bigking/gugu-agent.git
    cd agent-service-toolkit
    ```
 

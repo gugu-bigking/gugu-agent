@@ -1,9 +1,9 @@
 [project]
-name = "agent-service-toolkit"
+name = "gugu-agent"
 version = "0.1.0"
 description = "Full toolkit for running an AI agent service built with LangGraph, FastAPI and Streamlit"
 readme = "README.md"
-authors = [{ name = "Joshua Carroll", email = "carroll.joshk@gmail.com" }]
+authors = [{ name = "gugu", email = "3535444976@qq.com" }]
 classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
@@ -64,13 +64,13 @@ dependencies = [
 # repo's pinned uv version (older uv ignores this and strips it from uv.lock on re-lock).
 # Policy and override procedure: .claude/skills/dependency-refresh/SKILL.md
 [tool.uv]
-exclude-newer = "14 days"
+# exclude-newer = "14 days"
 
-[tool.uv.exclude-newer-package]
+# [tool.uv.exclude-newer-package]
 # gitpython 3.1.54 fixes a vulnerability (Dependabot alert #157); streamlit pins it
 # exactly, so the global cooldown blocks resolution until 3.1.54 clears 14 days old.
 # Remove this override once 3.1.54 is >14 days old (~2026-08-05).
-gitpython = "0 days"
+# gitpython = "0 days"
 
 [dependency-groups]
 dev = [
