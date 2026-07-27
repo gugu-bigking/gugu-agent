@@ -19,6 +19,7 @@ from schema.models import (
     FakeModelName,
     GoogleModelName,
     GroqModelName,
+    MiniMaxModelName,
     OllamaModelName,
     OpenAICompatibleName,
     OpenAIModelName,
@@ -38,6 +39,7 @@ _MODEL_TABLE = (
     | {m: m.value for m in AWSModelName}
     | {m: m.value for m in OllamaModelName}
     | {m: m.value for m in OpenRouterModelName}
+    | {m: m.value for m in MiniMaxModelName}
     | {m: m.value for m in FakeModelName}
 )
 
@@ -142,6 +144,16 @@ def get_model(model_name: AllModelEnum, /) -> ModelT:
             streaming=True,
             base_url="https://openrouter.ai/api/v1/",
             api_key=settings.OPENROUTER_API_KEY,
+        )
+    if model_name in MiniMaxModelName:
+        if not settings.MINIMAX_API_KEY:
+            raise ValueError("MiniMax API key must be configured")
+        return ChatAnthropic(
+            model_name=api_model_name,
+            temperature=0.5,
+            streaming=True,
+            base_url="https://api.minimaxi.com/anthropic",
+            api_key=settings.MINIMAX_API_KEY,
         )
     if model_name in FakeModelName:
         return FakeToolModel(responses=["This is a test response from the fake model."])

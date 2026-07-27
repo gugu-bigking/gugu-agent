@@ -56,6 +56,7 @@ from schema.models import (  # noqa: E402
     DeepseekModelName,
     GoogleModelName,
     GroqModelName,
+    MiniMaxModelName,
     OpenAIModelName,
     OpenRouterModelName,
     Provider,
@@ -77,6 +78,7 @@ PROVIDER_MODELS: dict[Provider, tuple[type[AllModelEnum], Callable[[], bool]]] =
     Provider.AWS: (AWSModelName, lambda: settings.USE_AWS_BEDROCK),
     Provider.AZURE_OPENAI: (AzureOpenAIModelName, lambda: bool(settings.AZURE_OPENAI_API_KEY)),
     Provider.VERTEXAI: (VertexAIModelName, lambda: bool(settings.GOOGLE_APPLICATION_CREDENTIALS)),
+    Provider.MINIMAX: (MiniMaxModelName, lambda: bool(settings.MINIMAX_API_KEY)),
 }
 
 

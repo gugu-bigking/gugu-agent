@@ -13,6 +13,7 @@ class Provider(StrEnum):
     AWS = auto()
     OLLAMA = auto()
     OPENROUTER = auto()
+    MINIMAX = auto()
     FAKE = auto()
 
 
@@ -85,6 +86,13 @@ class GroqModelName(StrEnum):
     GPT_OSS_SAFEGUARD_20B = "openai/gpt-oss-safeguard-20b"
 
 
+class MiniMaxModelName(StrEnum):
+    """https://platform.minimaxi.com — accessed via Anthropic-compatible protocol at api.minimaxi.com/anthropic (coding-plan keys, sk-cp- prefix)."""
+
+    MINIMAX_M3 = "MiniMax-M3"
+    MINIMAX_M2_7 = "MiniMax-M2.7"
+
+
 class AWSModelName(StrEnum):
     """https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html"""
 
@@ -130,5 +138,6 @@ type AllModelEnum = (
     | AWSModelName
     | OllamaModelName
     | OpenRouterModelName
+    | MiniMaxModelName
     | FakeModelName
 )
