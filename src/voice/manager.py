@@ -5,9 +5,10 @@ All Streamlit dependencies are isolated here.
 """
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import streamlit as st
+from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 from voice.stt import SpeechToText
 from voice.tts import TextToSpeech
@@ -103,57 +104,58 @@ class VoiceManager:
 
         return transcribed
 
-    def get_chat_input(self, placeholder: str = "Your message") -> str | None:
-        """Get chat input with optional voice transcription.
+    def get_chat_input(
+        self,
+        placeholder: str = "Your message",
+        file_type: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Get chat input with optional voice transcription and file uploads.
 
         Handles Streamlit UI including audio input widget and transcription
-        feedback (spinner, errors).
+        feedback (spinner, errors). File uploads are always enabled so users
+        can attach images/documents regardless of whether voice is configured.
 
         Args:
             placeholder: Placeholder text for input
+            file_type: Optional list of allowed file extensions for uploads.
 
         Returns:
-            User's message (transcribed if audio, otherwise text), or None if no input
+            Dict with keys "text" (str), "files" (list[UploadedFile]),
+            "audio" (UploadedFile | None). Returns None when the user has
+            not submitted anything yet.
         """
-        # No STT - use regular text input
-        if not self.stt:
-            return st.chat_input(placeholder)
+        kwargs: dict[str, Any] = {"accept_file": "multiple"}
+        if file_type:
+            kwargs["file_type"] = file_type
+        if self.stt:
+            kwargs["accept_audio"] = True
 
-        # STT enabled - use audio-capable input
-        chat_value = st.chat_input(placeholder, accept_audio=True)
+        chat_value = st.chat_input(placeholder, **kwargs)
 
-        if not chat_value:
+        if chat_value is None:
             return None
 
-        # Handle string return (text-only input)
+        # Older Streamlit returns a bare str when neither accept_file nor
+        # accept_audio is set; newer builds always return a ChatInputValue.
         if isinstance(chat_value, str):
-            return chat_value
+            return {"text": chat_value, "files": [], "audio": None}
 
-        # Handle object/dict return (audio-capable input)
-        # Extract text - support both attribute and dict access
-        text_content = None
-        if hasattr(chat_value, "text"):
-            text_content = chat_value.text
-        elif isinstance(chat_value, dict):
-            text_content = chat_value.get("text", "")
+        text = chat_value["text"] if isinstance(chat_value, dict) else getattr(chat_value, "text", "")
+        files: list[UploadedFile] = (
+            chat_value["files"] if isinstance(chat_value, dict) else list(getattr(chat_value, "files", []))
+        )
+        audio: UploadedFile | None = (
+            chat_value["audio"] if isinstance(chat_value, dict) else getattr(chat_value, "audio", None)
+        )
 
-        # Extract audio - support both attribute and dict access
-        audio_content = None
-        if hasattr(chat_value, "audio"):
-            audio_content = chat_value.audio
-        elif isinstance(chat_value, dict):
-            audio_content = chat_value.get("audio")
+        # Audio takes precedence over typed text: transcribe the recording and
+        # use it as the message text.
+        if audio and self.stt:
+            transcribed = self._transcribe_audio(audio)
+            if transcribed is not None:
+                text = transcribed
 
-        # If audio is provided, transcribe it
-        if audio_content:
-            return self._transcribe_audio(audio_content)
-
-        # If no audio, return the text content
-        if text_content:
-            return text_content
-
-        # No text or audio provided
-        return None
+        return {"text": text or "", "files": list(files), "audio": audio if not self.stt else None}
 
     def render_message(self, content: str, container=None, audio_only: bool = False) -> None:
         """Render message with optional TTS audio.

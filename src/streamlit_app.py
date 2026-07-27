@@ -8,7 +8,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from client import AgentClient, AgentClientError
+from client import AgentClient, AgentClientError, Attachment
 from schema import ChatHistory, ChatMessage
 from schema.task_data import TaskData, TaskDataStatus
 from voice import VoiceManager
@@ -27,6 +27,37 @@ from voice import VoiceManager
 APP_TITLE = "Agent Service Toolkit"
 APP_ICON = "🧰"
 USER_ID_COOKIE = "user_id"
+
+# File extensions accepted by the chat input's upload button. Keep in sync
+# with the MIME types the server-side understand_document tool understands.
+ATTACHMENT_TYPES = ["png", "jpg", "jpeg", "gif", "webp", "docx", "md", "txt"]
+
+_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+}
+
+
+def _build_attachments(uploaded_files) -> list[Attachment]:
+    """Convert chat_input uploaded files into AgentClient Attachment dicts."""
+    attachments: list[Attachment] = []
+    for f in uploaded_files:
+        suffix = "." + f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
+        mime = _MIME_BY_SUFFIX.get(suffix, f.type or "application/octet-stream")
+        attachments.append(
+            Attachment(
+                filename=f.name,
+                mime_type=mime,
+                bytes=f.getvalue(),
+            )
+        )
+    return attachments
 
 
 def get_or_create_user_id() -> str:
@@ -230,6 +261,12 @@ async def main() -> None:
             case "rag-assistant":
                 WELCOME = """Hello! I'm an AI-powered Company Policy & HR assistant with access to AcmeTech's Employee Handbook.
                 I can help you find information about benefits, remote work, time-off policies, company values, and more. Ask me anything!"""
+            case "gugu-agent":
+                WELCOME = (
+                    "Hey, I'm gugu — your hybrid RAG assistant. I search the handbook with "
+                    "BM25 + dense retrieval and rerank the results, and I'll fall back to the "
+                    "live web for anything not internal. Ask me anything!"
+                )
             case _:
                 WELCOME = "Hello! I'm an AI agent. Ask me anything!"
 
@@ -258,24 +295,36 @@ async def main() -> None:
             st.audio(audio_data["data"], format=audio_data["format"])
 
     # Generate new message if the user provided new input
-    # Use voice manager if available, otherwise fall back to regular input
     # REQUIRED: Set VOICE_STT_PROVIDER, VOICE_TTS_PROVIDER, OPENAI_API_KEY
     # in app .env (NOT service .env) to enable voice features.
-    if voice:
-        user_input = voice.get_chat_input()
-    else:
-        user_input = st.chat_input()
+    chat_input = voice.get_chat_input(file_type=ATTACHMENT_TYPES) if voice else None
+    if chat_input is None:
+        chat_input = st.chat_input(accept_file="multiple", file_type=ATTACHMENT_TYPES)
 
-    if user_input:
-        messages.append(ChatMessage(type="human", content=user_input))
-        st.chat_message("human").write(user_input)
+    user_text = chat_input["text"] if chat_input else ""
+    uploaded_files = chat_input["files"] if chat_input else []
+
+    if chat_input and uploaded_files and not user_text.strip():
+        # Attachments need at least a non-empty text message; nudge the user
+        # instead of silently dropping the files.
+        st.toast("请输入文字后再发送附件", icon="⚠️")
+        chat_input = None
+
+    if chat_input:
+        attachments = _build_attachments(uploaded_files) if uploaded_files else None
+        display_text = user_text or "(attached file)"
+        messages.append(ChatMessage(type="human", content=display_text))
+        st.chat_message("human").write(display_text)
+        for att_meta in uploaded_files:
+            st.chat_message("human").caption(f"📎 {att_meta.name}")
         try:
             if use_streaming:
                 stream = agent_client.astream(
-                    message=user_input,
+                    message=user_text,
                     model=model,
                     thread_id=st.session_state.thread_id,
                     user_id=user_id,
+                    attachments=attachments,
                 )
                 await draw_messages(stream, is_new=True)
                 # Generate TTS audio for streaming response
@@ -293,10 +342,11 @@ async def main() -> None:
                         )
             else:
                 response = await agent_client.ainvoke(
-                    message=user_input,
+                    message=user_text,
                     model=model,
                     thread_id=st.session_state.thread_id,
                     user_id=user_id,
+                    attachments=attachments,
                 )
                 messages.append(response)
                 # Render AI response with optional voice

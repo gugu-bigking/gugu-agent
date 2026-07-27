@@ -7,6 +7,7 @@ from agents.bg_task_agent.bg_task_agent import bg_task_agent
 from agents.chatbot import chatbot
 from agents.command_agent import command_agent
 from agents.github_mcp_agent.github_mcp_agent import github_mcp_agent
+from agents.gugu_agent import gugu_agent
 from agents.interrupt_agent import interrupt_agent
 from agents.knowledge_base_agent import kb_agent
 from agents.langgraph_supervisor_agent import langgraph_supervisor_agent
@@ -16,7 +17,7 @@ from agents.rag_assistant import rag_assistant
 from agents.research_assistant import research_assistant
 from schema import AgentInfo
 
-DEFAULT_AGENT = "research-assistant"
+DEFAULT_AGENT = "gugu-agent"
 
 # Type alias to handle LangGraph's different agent patterns
 # - @entrypoint functions return Pregel
@@ -60,6 +61,12 @@ agents: dict[str, Agent] = {
     "github-mcp-agent": Agent(
         description="A GitHub agent with MCP tools for repository management and development workflows.",
         graph_like=github_mcp_agent,
+    ),
+    "gugu-agent": Agent(
+        description=(
+            "Gugu: hybrid RAG (BM25 + dense) with cross-encoder reranking, plus web search."
+        ),
+        graph_like=gugu_agent,
     ),
 }
 

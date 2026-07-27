@@ -1,9 +1,37 @@
-from typing import Any, Literal, NotRequired
+from typing import Any, Literal, NotRequired, Union
 
 from pydantic import BaseModel, Field, SerializeAsAny
 from typing_extensions import TypedDict
 
 from schema.models import AllModelEnum, AnthropicModelName, OpenAIModelName
+
+
+class TextContentBlock(TypedDict):
+    """Plain text content block (OpenAI-compatible)."""
+
+    type: Literal["text"]
+    text: str
+
+
+class ImageContentBlock(TypedDict):
+    """Image content block: either a URL or inline base64 data URL."""
+
+    type: Literal["image_url"]
+    image_url: dict[str, str]
+
+
+class FileContentBlock(TypedDict):
+    """File content block: filename + base64-encoded bytes.
+
+    Gugu-agent extracts the text via the `understand_document` tool on the
+    server side; this block is not passed directly to the LLM.
+    """
+
+    type: Literal["file"]
+    file: dict[str, str]
+
+
+ContentBlock = TextContentBlock | ImageContentBlock | FileContentBlock
 
 
 class AgentInfo(BaseModel):
@@ -40,8 +68,8 @@ class ServiceMetadata(BaseModel):
 class UserInput(BaseModel):
     """Basic user input for the agent."""
 
-    message: str = Field(
-        description="User input to the agent.",
+    message: Union[str, list[ContentBlock]] = Field(  # noqa: UP007
+        description="User input to the agent. Either a plain string or a list of multimodal content blocks (text/image_url/file).",
         examples=["What is the weather in Tokyo?"],
     )
     model: SerializeAsAny[AllModelEnum] | None = Field(
@@ -95,8 +123,8 @@ class ChatMessage(BaseModel):
         description="Role of the message.",
         examples=["human", "ai", "tool", "custom"],
     )
-    content: str = Field(
-        description="Content of the message.",
+    content: Union[str, list[ContentBlock]] = Field(  # noqa: UP007
+        description="Content of the message. Either a plain string or a list of multimodal content blocks.",
         examples=["Hello, world!"],
     )
     tool_calls: list[ToolCall] = Field(

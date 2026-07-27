@@ -175,7 +175,8 @@ async def _handle_input(user_input: UserInput, agent: AgentGraph) -> tuple[dict[
         # assume user input is response to resume agent execution from interrupt
         input = Command(resume=user_input.message)
     else:
-        input = {"messages": [HumanMessage(content=user_input.message)]}
+        human_content = _build_human_content(user_input.message)  # type: ignore[arg-type]
+        input = {"messages": [HumanMessage(content=human_content)]}  # type: ignore[arg-type]
 
     kwargs = {
         "input": input,
@@ -344,6 +345,49 @@ def _create_ai_message(parts: dict) -> AIMessage:
     valid_keys = set(sig.parameters)
     filtered = {k: v for k, v in parts.items() if k in valid_keys}
     return AIMessage(**filtered)
+
+
+def _build_human_content(message: str | list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+    """Resolve file attachments server-side before forwarding to the LLM.
+
+    - `str` -> pass through
+    - `file` blocks -> extract text via the same logic as `understand_document`
+      and inline as a text block; drop the raw bytes from the LLM message
+    - `image_url` blocks -> pass through (vision-capable models handle natively)
+    - `text` blocks -> pass through
+    """
+    if isinstance(message, str):
+        return message
+
+    from agents.tools import understand_document_func
+
+    resolved: list[dict[str, Any]] = []
+    for block in message:
+        block_type = block.get("type")
+        if block_type == "file":
+            file_meta = block.get("file", {})
+            filename = file_meta.get("filename", "uploaded")
+            data_b64 = file_meta.get("data_b64", "")
+            try:
+                extracted = understand_document_func(data_b64, filename)
+            except Exception as e:
+                extracted = f"[Failed to extract {filename}: {e}]"
+            resolved.append({
+                "type": "text",
+                "text": f"[Attached file: {filename}]\n{extracted}",
+            })
+        elif block_type == "image_url":
+            resolved.append(block)
+        elif block_type == "text":
+            resolved.append(block)
+        else:
+            logger.warning("Skipping unknown content block type: %s", block_type)
+
+    if not resolved:
+        return ""
+    if len(resolved) == 1 and resolved[0].get("type") == "text":
+        return resolved[0]["text"]
+    return resolved
 
 
 def _sse_response_example() -> dict[int | str, Any]:

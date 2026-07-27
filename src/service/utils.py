@@ -33,7 +33,7 @@ def convert_message_content_to_string(content: str | list[str | dict]) -> str:
         if isinstance(content_item, str):
             text.append(content_item)
             continue
-        if content_item["type"] == "text":
+        if content_item.get("type") == "text":
             text.append(content_item["text"])
     return "".join(text)
 

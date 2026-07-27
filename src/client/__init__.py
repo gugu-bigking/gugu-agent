@@ -1,3 +1,3 @@
-from client.client import AgentClient, AgentClientError
+from client.client import AgentClient, AgentClientError, Attachment
 
-__all__ = ["AgentClient", "AgentClientError"]
+__all__ = ["AgentClient", "AgentClientError", "Attachment"]

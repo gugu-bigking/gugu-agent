@@ -1,9 +1,11 @@
+import base64
 import json
 import os
 from collections.abc import AsyncGenerator, Generator
-from typing import Any
+from typing import Any, NotRequired
 
 import httpx
+from typing_extensions import TypedDict
 
 from schema import (
     ChatHistory,
@@ -16,8 +18,74 @@ from schema import (
 )
 
 
+class Attachment(TypedDict):
+    """A single file or image attachment sent alongside a user message.
+
+    Either provide `bytes` (raw file bytes — they will be base64-encoded here)
+    or `data_b64` (already-encoded). Exactly one of the two must be set.
+    `mime_type` and `filename` are required.
+    """
+
+    filename: str
+    mime_type: str
+    bytes: NotRequired[bytes]
+    data_b64: NotRequired[str]
+
+
 class AgentClientError(Exception):
     pass
+
+
+_IMAGE_MIME_PREFIXES = ("image/",)
+_DOC_MIME_BY_SUFFIX = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+}
+
+
+def _attachment_to_block(att: Attachment) -> dict[str, Any]:
+    """Turn an Attachment into a multimodal content block.
+
+    - Image MIME -> image_url with an inline data URL.
+    - .docx / .md / .txt -> file block with base64 bytes.
+    - Other -> file block (server will reject unsupported types).
+    """
+    if "bytes" in att and "data_b64" in att:
+        raise AgentClientError(f"Attachment {att['filename']}: provide only one of bytes / data_b64")
+    if "bytes" not in att and "data_b64" not in att:
+        raise AgentClientError(f"Attachment {att['filename']}: must provide bytes or data_b64")
+
+    data_b64 = att.get("data_b64") or base64.b64encode(att["bytes"]).decode("ascii")
+    mime = att["mime_type"]
+    filename = att["filename"]
+
+    if mime.startswith(_IMAGE_MIME_PREFIXES):
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{data_b64}"},
+        }
+    return {
+        "type": "file",
+        "file": {"filename": filename, "mime_type": mime, "data_b64": data_b64},
+    }
+
+
+def _build_message(
+    message: str,
+    attachments: list[Attachment] | None,
+) -> str | list[dict[str, Any]]:
+    """Combine a user message with optional attachments into a UserInput payload."""
+    blocks: list[dict[str, Any]] = []
+    if message:
+        blocks.append({"type": "text", "text": message})
+    for att in attachments or []:
+        blocks.append(_attachment_to_block(att))
+    if not blocks:
+        return ""
+    if len(blocks) == 1 and blocks[0]["type"] == "text":
+        return blocks[0]["text"]
+    return blocks
 
 
 class AgentClient:
@@ -90,6 +158,7 @@ class AgentClient:
         thread_id: str | None = None,
         user_id: str | None = None,
         agent_config: dict[str, Any] | None = None,
+        attachments: list[Attachment] | None = None,
     ) -> ChatMessage:
         """
         Invoke the agent asynchronously. Only the final message is returned.
@@ -100,13 +169,14 @@ class AgentClient:
             thread_id (str, optional): Thread ID for continuing a conversation
             user_id (str, optional): User ID for continuing a conversation across multiple threads
             agent_config (dict[str, Any], optional): Additional configuration to pass through to the agent
+            attachments (list[Attachment], optional): Files / images to send alongside the message
 
         Returns:
             AnyMessage: The response from the agent
         """
         if not self.agent:
             raise AgentClientError("No agent selected. Use update_agent() to select an agent.")
-        request = UserInput(message=message)
+        request = UserInput(message=_build_message(message, attachments))
         if thread_id:
             request.thread_id = thread_id
         if model:
@@ -136,6 +206,7 @@ class AgentClient:
         thread_id: str | None = None,
         user_id: str | None = None,
         agent_config: dict[str, Any] | None = None,
+        attachments: list[Attachment] | None = None,
     ) -> ChatMessage:
         """
         Invoke the agent synchronously. Only the final message is returned.
@@ -146,13 +217,14 @@ class AgentClient:
             thread_id (str, optional): Thread ID for continuing a conversation
             user_id (str, optional): User ID for continuing a conversation across multiple threads
             agent_config (dict[str, Any], optional): Additional configuration to pass through to the agent
+            attachments (list[Attachment], optional): Files / images to send alongside the message
 
         Returns:
             ChatMessage: The response from the agent
         """
         if not self.agent:
             raise AgentClientError("No agent selected. Use update_agent() to select an agent.")
-        request = UserInput(message=message)
+        request = UserInput(message=_build_message(message, attachments))
         if thread_id:
             request.thread_id = thread_id
         if model:
@@ -207,6 +279,7 @@ class AgentClient:
         user_id: str | None = None,
         agent_config: dict[str, Any] | None = None,
         stream_tokens: bool = True,
+        attachments: list[Attachment] | None = None,
     ) -> Generator[ChatMessage | str, None, None]:
         """
         Stream the agent's response synchronously.
@@ -229,7 +302,7 @@ class AgentClient:
         """
         if not self.agent:
             raise AgentClientError("No agent selected. Use update_agent() to select an agent.")
-        request = StreamInput(message=message, stream_tokens=stream_tokens)
+        request = StreamInput(message=_build_message(message, attachments), stream_tokens=stream_tokens)
         if thread_id:
             request.thread_id = thread_id
         if user_id:
@@ -264,6 +337,7 @@ class AgentClient:
         user_id: str | None = None,
         agent_config: dict[str, Any] | None = None,
         stream_tokens: bool = True,
+        attachments: list[Attachment] | None = None,
     ) -> AsyncGenerator[ChatMessage | str, None]:
         """
         Stream the agent's response asynchronously.
@@ -286,7 +360,7 @@ class AgentClient:
         """
         if not self.agent:
             raise AgentClientError("No agent selected. Use update_agent() to select an agent.")
-        request = StreamInput(message=message, stream_tokens=stream_tokens)
+        request = StreamInput(message=_build_message(message, attachments), stream_tokens=stream_tokens)
         if thread_id:
             request.thread_id = thread_id
         if model:
