@@ -1,37 +1,58 @@
+"""Streamlit UI for the gugu-agent service.
+
+Major changes vs. the upstream template:
+
+- **Branding.** "gugu-agent" header, "Made with ♥ by gugu with AI" footer.
+- **Persistent chat list.** Sidebar shows recent chats from the
+  gugu-chats metadata endpoint; messages stay in the LangGraph
+  checkpointer. Clicking a row switches threads.
+- **Queue + force interrupt.** While a stream is in flight, additional
+  messages are queued; a single "Stop" button cancels the active run
+  and clears the queue.
+- **Typed errors with retry.** Network / 5xx / 4xx / timeout /
+  stream-interrupt are surfaced as a red banner with a Retry button.
+  The last user input is stashed so retry does not lose context.
+- **Visible "thinking" indicator.** A local status placeholder shows
+  the moment a turn is in flight and is replaced as soon as the first
+  token lands.
+"""
+
 import asyncio
 import os
 import urllib.parse
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import datetime
+from typing import Any
 
 import streamlit as st
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from client import AgentClient, AgentClientError, Attachment
-from schema import ChatHistory, ChatMessage
+from client import (
+    AgentClient,
+    AgentClientError,
+    Attachment,
+    StreamClientError,
+    StreamInterruptedError,
+    StreamNetworkError,
+    StreamServerError,
+    StreamTimeoutError,
+)
+from schema import ChatMessage, ChatMetaItem
 from schema.task_data import TaskData, TaskDataStatus
 from voice import VoiceManager
 
-# A Streamlit app for interacting with the langgraph agent via a simple chat interface.
-# The app has three main functions which are all run async:
-
-# - main() - sets up the streamlit app and high level structure
-# - draw_messages() - draws a set of chat messages - either replaying existing messages
-#   or streaming new ones.
-# - handle_feedback() - Draws a feedback widget and records feedback from the user.
-
-# The app heavily uses AgentClient to interact with the agent's FastAPI endpoints.
-
-
-APP_TITLE = "Agent Service Toolkit"
-APP_ICON = "🧰"
+APP_TITLE = "gugu-agent"
+APP_ICON = "💬"
+APP_TAGLINE = "hybrid RAG · web · MCP"
+APP_FOOTER = "Made with :material/favorite: by gugu with AI"
 USER_ID_COOKIE = "user_id"
+HISTORY_LIMIT = 30
+STOP_FLAG = "cancel_requested"
+ACTIVE_KEY = "active_request_id"
 
-# File extensions accepted by the chat input's upload button. Keep in sync
-# with the MIME types the server-side understand_document tool understands.
 ATTACHMENT_TYPES = ["png", "jpg", "jpeg", "gif", "webp", "docx", "md", "txt"]
-
 _MIME_BY_SUFFIX = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -45,53 +66,161 @@ _MIME_BY_SUFFIX = {
 
 
 def _build_attachments(uploaded_files) -> list[Attachment]:
-    """Convert chat_input uploaded files into AgentClient Attachment dicts."""
     attachments: list[Attachment] = []
     for f in uploaded_files:
         suffix = "." + f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
         mime = _MIME_BY_SUFFIX.get(suffix, f.type or "application/octet-stream")
         attachments.append(
-            Attachment(
-                filename=f.name,
-                mime_type=mime,
-                bytes=f.getvalue(),
-            )
+            Attachment(filename=f.name, mime_type=mime, bytes=f.getvalue())
         )
     return attachments
 
 
 def get_or_create_user_id() -> str:
-    """Get the user ID from session state or URL parameters, or create a new one if it doesn't exist."""
-    # Check if user_id exists in session state
     if USER_ID_COOKIE in st.session_state:
         return st.session_state[USER_ID_COOKIE]
-
-    # Try to get from URL parameters using the new st.query_params
     if USER_ID_COOKIE in st.query_params:
         user_id = st.query_params[USER_ID_COOKIE]
         st.session_state[USER_ID_COOKIE] = user_id
         return user_id
-
-    # Generate a new user_id if not found
     user_id = str(uuid.uuid4())
-
-    # Store in session state for this session
     st.session_state[USER_ID_COOKIE] = user_id
-
-    # Also add to URL parameters so it can be bookmarked/shared
     st.query_params[USER_ID_COOKIE] = user_id
-
     return user_id
 
 
-async def main() -> None:
-    st.set_page_config(
-        page_title=APP_TITLE,
-        page_icon=APP_ICON,
-        menu_items={},
-    )
+def _format_relative_time(epoch: float) -> str:
+    if not epoch:
+        return ""
+    delta = datetime.now().timestamp() - epoch
+    if delta < 0:
+        delta = 0
+    if delta < 60:
+        return "now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h"
+    if delta < 86400 * 2:
+        return "Yesterday"
+    if delta < 86400 * 7:
+        return f"{int(delta // 86400)}d"
+    return datetime.fromtimestamp(epoch).strftime("%m-%d")
 
-    # Hide the streamlit upper-right chrome
+
+def _ensure_state() -> None:
+    defaults: dict[str, Any] = {
+        "pending_messages": [],
+        ACTIVE_KEY: None,
+        STOP_FLAG: False,
+        "error_state": None,
+        "last_user_input": None,
+        "chat_meta_cache": {},
+        "chat_meta_loaded_for": None,
+        "last_attachment_meta": [],
+        "last_message": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def _on_new_chat() -> None:
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.messages = []
+    st.session_state.last_user_input = None
+    st.session_state.error_state = None
+    st.session_state.last_attachment_meta = []
+    st.session_state.pop("last_audio", None)
+
+
+def _on_switch_chat(thread_id: str):
+    def _cb() -> None:
+        if thread_id == st.session_state.thread_id:
+            return
+        st.session_state.thread_id = thread_id
+        st.session_state.messages = None
+        st.session_state.error_state = None
+        st.session_state.last_user_input = None
+        st.session_state.last_attachment_meta = []
+        st.session_state.pop("last_audio", None)
+
+    return _cb
+
+
+def _on_stop() -> None:
+    st.session_state[STOP_FLAG] = True
+    st.session_state.pending_messages = []
+
+
+def _on_retry() -> None:
+    last = st.session_state.last_user_input
+    if not last:
+        return
+    st.session_state.error_state = None
+    if last not in st.session_state.pending_messages:
+        st.session_state.pending_messages.insert(0, last)
+
+
+def _on_dismiss_error() -> None:
+    st.session_state.error_state = None
+
+
+def _classify_error_label(kind: str) -> str:
+    return {
+        "StreamNetworkError": "Can't reach the service",
+        "StreamTimeoutError": "Service timed out",
+        "StreamServerError": "Service error",
+        "StreamClientError": "Request was rejected",
+        "StreamInterruptedError": "Stream interrupted",
+    }.get(kind, "Request failed")
+
+
+def _classify_error_help(kind: str) -> str:
+    return {
+        "StreamNetworkError": "Check the connection or whether the service is running, then retry.",
+        "StreamTimeoutError": "The service took too long. Retry, or pick a smaller model.",
+        "StreamServerError": "The service hit an error. Retry — it may be transient.",
+        "StreamClientError": "The service rejected this request. Adjust the message or settings.",
+        "StreamInterruptedError": "The stream ended before the response finished. The service may have restarted.",
+    }.get(kind, "Something went wrong. Retry to try again.")
+
+
+async def _cancellable(gen: AsyncGenerator[Any, None], flag_key: str) -> AsyncGenerator[Any, None]:
+    # Just `return` — `async for` cleans up the inner generator on exit.
+    # Calling `aclose()` on `gen` from inside its own `async for` triggers
+    # `RuntimeError: aclose(): asynchronous generator is already running`.
+    async for event in gen:
+        if st.session_state.get(flag_key):
+            return
+        yield event
+
+
+async def _first_event_evict(gen: AsyncGenerator[Any, None], holder) -> AsyncGenerator[Any, None]:
+    cleared = False
+    async for event in gen:
+        if not cleared:
+            holder.empty()
+            cleared = True
+        yield event
+
+
+async def main() -> None:
+    # set_page_config() must be the first Streamlit call. The toolbar
+    # manipulation below may schedule a rerun, so guard it with a
+    # session_state flag — never call set_page_config on the rerun path.
+    if (
+        "toolbar_minimal_applied" not in st.session_state
+        and st.get_option("client.toolbarMode") != "minimal"
+    ):
+        st.session_state.toolbar_minimal_applied = True
+        st.set_option("client.toolbarMode", "minimal")
+        await asyncio.sleep(0.1)
+        st.rerun()
+        return
+
+    st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON, menu_items={})
+
     st.html(
         """
         <style>
@@ -103,12 +232,15 @@ async def main() -> None:
         </style>
         """,
     )
-    if st.get_option("client.toolbarMode") != "minimal":
-        st.set_option("client.toolbarMode", "minimal")
-        await asyncio.sleep(0.1)
+
+    _ensure_state()
+
+    # Recover from a previous run that was cancelled mid-stream.
+    if st.session_state.get(STOP_FLAG) and st.session_state.get(ACTIVE_KEY) is not None:
+        st.session_state[ACTIVE_KEY] = None
+        st.session_state[STOP_FLAG] = False
         st.rerun()
 
-    # Get or create user ID
     user_id = get_or_create_user_id()
 
     if "agent_client" not in st.session_state:
@@ -127,7 +259,6 @@ async def main() -> None:
             st.stop()
     agent_client: AgentClient = st.session_state.agent_client
 
-    # Initialize voice manager (once per session)
     if "voice_manager" not in st.session_state:
         st.session_state.voice_manager = VoiceManager.from_env()
     voice = st.session_state.voice_manager
@@ -136,46 +267,94 @@ async def main() -> None:
         thread_id = st.query_params.get("thread_id")
         if not thread_id:
             thread_id = str(uuid.uuid4())
-            messages = []
+            messages: list[ChatMessage] = []
         else:
-            # Read the agent from the URL so history is fetched through the graph that
-            # created the thread.
             resume_agent = st.query_params.get("agent") or agent_client.agent
             try:
-                messages: ChatHistory = agent_client.get_history(
-                    thread_id=thread_id, agent=resume_agent
+                messages = (
+                    await asyncio.to_thread(
+                        agent_client.get_history,
+                        thread_id=thread_id,
+                        agent=resume_agent,
+                    )
                 ).messages
             except AgentClientError:
                 st.error("No message history found for this Thread ID.")
                 messages = []
         st.session_state.messages = messages
         st.session_state.thread_id = thread_id
+    elif st.session_state.get("messages") is None:
+        try:
+            st.session_state.messages = (
+                await asyncio.to_thread(
+                    agent_client.get_history,
+                    thread_id=st.session_state.thread_id,
+                    agent=agent_client.agent,
+                )
+            ).messages
+        except AgentClientError:
+            st.session_state.messages = []
 
-    # Keep thread_id in the URL so the address bar is directly shareable.
     st.query_params["thread_id"] = st.session_state.thread_id
 
-    # Config options
+    # Refresh chat metadata list lazily.
+    if st.session_state.get("chat_meta_loaded_for") != user_id:
+        try:
+            chats = await agent_client.alist_chats(user_id=user_id)
+            st.session_state.chat_meta_cache = {c.thread_id: c for c in chats}
+        except AgentClientError:
+            st.session_state.chat_meta_cache = {}
+        st.session_state.chat_meta_loaded_for = user_id
+
     with st.sidebar:
-        st.header(f"{APP_ICON} {APP_TITLE}")
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:8px;"
+            f"margin:6px 0 2px;'>"
+            f"<span style='font-size:1.45em;line-height:1;'>{APP_ICON}</span>"
+            f"<span style='font-weight:600;font-size:1.1em;'>{APP_TITLE}</span>"
+            f"</div>"
+            f"<div style='color:#6b7280;font-size:0.78em;margin-bottom:10px;'>"
+            f"{APP_TAGLINE}</div>",
+            unsafe_allow_html=True,
+        )
 
-        ""
-        "Full toolkit for running an AI agent service built with LangGraph, FastAPI and Streamlit"
-        ""
+        st.button(
+            ":material/chat: New chat",
+            use_container_width=True,
+            key="new_chat_btn",
+            on_click=_on_new_chat,
+        )
 
-        if st.button(":material/chat: New Chat", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.thread_id = str(uuid.uuid4())
-            # Clear saved audio when starting new chat
-            if "last_audio" in st.session_state:
-                del st.session_state.last_audio
-            st.rerun()
+        st.divider()
+        st.caption("HISTORY")
+        chats: list[ChatMetaItem] = list(st.session_state.chat_meta_cache.values())
+        chats.sort(key=lambda c: c.updated_at, reverse=True)
+        current_thread = st.session_state.thread_id
+        if not chats:
+            st.caption("No saved chats yet.")
+        for chat in chats[:HISTORY_LIMIT]:
+            is_active = chat.thread_id == current_thread
+            label = chat.title[:34] or "New chat"
+            time_str = _format_relative_time(chat.updated_at)
+            if time_str:
+                label = f"{label}  ·  {time_str}"
+            if is_active:
+                label = f"● {label}"
+            st.button(
+                label,
+                key=f"chat_{chat.thread_id}",
+                use_container_width=True,
+                disabled=is_active,
+                on_click=_on_switch_chat(chat.thread_id),
+            )
+
+        st.divider()
 
         with st.popover(":material/settings: Settings", use_container_width=True):
             model_idx = agent_client.info.models.index(agent_client.info.default_model)
             model = st.selectbox("LLM to use", options=agent_client.info.models, index=model_idx)
             agent_list = [a.key for a in agent_client.info.agents]
             agent_idx = agent_list.index(agent_client.info.default_agent)
-            # Sync the selection to the ?agent= URL param (dropped when it's the default).
             agent_client.agent = st.selectbox(
                 "Agent to use",
                 options=agent_list,
@@ -184,14 +363,10 @@ async def main() -> None:
                 bind="query-params",
             )
             use_streaming = st.toggle("Stream results", value=True)
-            # Audio toggle with callback: clears cached audio when toggled off
             enable_audio = st.toggle(
                 "Enable audio generation",
                 value=True,
                 disabled=not voice or not voice.tts,
-                help="Configure VOICE_TTS_PROVIDER in .env to enable"
-                if not voice or not voice.tts
-                else None,
                 on_change=lambda: (
                     st.session_state.pop("last_audio", None)
                     if not st.session_state.get("enable_audio", True)
@@ -199,8 +374,6 @@ async def main() -> None:
                 ),
                 key="enable_audio",
             )
-
-            # Display user ID (for debugging or user information)
             st.text_input("User ID (read-only)", value=user_id, disabled=True)
 
         @st.dialog("Architecture")
@@ -208,7 +381,7 @@ async def main() -> None:
             st.image(
                 "https://github.com/gugu-bigking/gugu-agent/blob/main/media/agent_architecture.png?raw=true"
             )
-            "[View full size on Github](https://github.com/gugu-bigking/gugu-agent/blob/main/media/agent_architecture.png)"
+            "[View full size on Github](https://github.com/gugu-bigking/gugu-agent)"
             st.caption(
                 "App hosted on [Streamlit Cloud](https://share.streamlit.io/) with FastAPI service running in [Azure](https://learn.microsoft.com/en-us/azure/app-service/)"
             )
@@ -223,8 +396,6 @@ async def main() -> None:
 
         @st.dialog("Share/resume chat")
         def share_chat_dialog() -> None:
-            # st.context.url is the browser URL (with query string stripped). Rebuild
-            # the params, including the agent so the thread resumes through the right graph.
             if not st.context.url:
                 st.error("Could not determine the app URL to build a shareable link.")
                 return
@@ -235,20 +406,16 @@ async def main() -> None:
                     USER_ID_COOKIE: user_id,
                 }
             )
-            chat_url = f"{st.context.url}?{query}"
-            st.markdown(f"**Chat URL:**\n```text\n{chat_url}\n```")
+            st.markdown(f"**Chat URL:**\n```text\n{st.context.url}?{query}\n```")
             st.info("Copy the above URL to share or revisit this chat")
 
         if st.button(":material/upload: Share/resume chat", use_container_width=True):
             share_chat_dialog()
 
         "[View the source code](https://github.com/gugu-bigking/gugu-agent)"
-        st.caption(
-            "Made with :material/favorite: by [Joshua](https://www.linkedin.com/in/joshua-k-carroll/) in Oakland"
-        )
+        st.caption(APP_FOOTER)
 
-    # Draw existing messages
-    messages: list[ChatMessage] = st.session_state.messages
+    messages: list[ChatMessage] = st.session_state.messages or []
 
     if len(messages) == 0:
         match agent_client.agent:
@@ -273,15 +440,12 @@ async def main() -> None:
         with st.chat_message("ai"):
             st.write(WELCOME)
 
-    # draw_messages() expects an async iterator over messages
     async def amessage_iter() -> AsyncGenerator[ChatMessage, None]:
         for m in messages:
             yield m
 
     await draw_messages(amessage_iter())
 
-    # Render saved audio for the last AI message (if it exists)
-    # This ensures audio persists across st.rerun() calls
     if (
         voice
         and enable_audio
@@ -294,73 +458,145 @@ async def main() -> None:
             audio_data = st.session_state.last_audio
             st.audio(audio_data["data"], format=audio_data["format"])
 
-    # Generate new message if the user provided new input
-    # REQUIRED: Set VOICE_STT_PROVIDER, VOICE_TTS_PROVIDER, OPENAI_API_KEY
-    # in app .env (NOT service .env) to enable voice features.
+    # Error banner with retry.
+    err = st.session_state.error_state
+    if err:
+        raw = err.get("error", "")
+        kind = err.get("kind", "AgentClientError")
+        st.error(f"Error generating response: {raw}")
+        st.markdown(f"**{_classify_error_label(kind)}.** {_classify_error_help(kind)}")
+        cols = st.columns([1, 1, 4])
+        cols[0].button("Retry", key="retry_btn", type="primary", on_click=_on_retry)
+        cols[1].button("Dismiss", key="dismiss_btn", on_click=_on_dismiss_error)
+
+    # Active run banner.
+    if st.session_state[ACTIVE_KEY] is not None:
+        queued = len(st.session_state.pending_messages)
+        msg = "Gugu is thinking…"
+        if queued:
+            msg = f"Gugu is thinking… ({queued} queued)"
+        st.info(msg, icon="⏳")
+        st.button(
+            ":material/stop: Stop",
+            key="stop_btn",
+            type="secondary",
+            on_click=_on_stop,
+        )
+
+    # Chat input.
     chat_input = voice.get_chat_input(file_type=ATTACHMENT_TYPES) if voice else None
     if chat_input is None:
         chat_input = st.chat_input(accept_file="multiple", file_type=ATTACHMENT_TYPES)
-
     user_text = chat_input["text"] if chat_input else ""
     uploaded_files = chat_input["files"] if chat_input else []
 
     if chat_input and uploaded_files and not user_text.strip():
-        # Attachments need at least a non-empty text message; nudge the user
-        # instead of silently dropping the files.
         st.toast("请输入文字后再发送附件", icon="⚠️")
         chat_input = None
 
     if chat_input:
         attachments = _build_attachments(uploaded_files) if uploaded_files else None
         display_text = user_text or "(attached file)"
-        messages.append(ChatMessage(type="human", content=display_text))
-        st.chat_message("human").write(display_text)
-        for att_meta in uploaded_files:
-            st.chat_message("human").caption(f"📎 {att_meta.name}")
+        new_input = {
+            "text": user_text,
+            "display_text": display_text,
+            "attachments": attachments,
+            "model": model,
+        }
+        human_msg = ChatMessage(type="human", content=display_text)
+        st.session_state.messages.append(human_msg)
+        st.session_state.last_user_input = new_input
+        st.session_state.last_attachment_meta = [a.name for a in (uploaded_files or [])]
+        st.session_state.pending_messages.append(new_input)
+        st.rerun()
+
+    # Process the queue when nothing is active.
+    if st.session_state[ACTIVE_KEY] is None and st.session_state.pending_messages:
+        next_input = st.session_state.pending_messages.pop(0)
+        st.session_state[ACTIVE_KEY] = id(next_input)
+        st.session_state[STOP_FLAG] = False
+        st.session_state.last_user_input = next_input
+        thread_id = st.session_state.thread_id
+
+        # Register the chat in metadata on the first message of a new thread.
+        cached = st.session_state.chat_meta_cache.get(thread_id)
+        if cached is None:
+            try:
+                item = await agent_client.acreate_chat(
+                    user_id=user_id,
+                    agent=agent_client.agent,
+                    first_message=next_input["text"],
+                )
+                st.session_state.thread_id = item.thread_id
+                st.query_params["thread_id"] = item.thread_id
+                st.session_state.chat_meta_cache[item.thread_id] = item
+            except AgentClientError:
+                # Degrade gracefully — the run still proceeds.
+                pass
+
         try:
             if use_streaming:
                 stream = agent_client.astream(
-                    message=user_text,
-                    model=model,
+                    message=next_input["text"],
+                    model=next_input["model"],
                     thread_id=st.session_state.thread_id,
                     user_id=user_id,
-                    attachments=attachments,
+                    attachments=next_input["attachments"],
                 )
-                await draw_messages(stream, is_new=True)
-                # Generate TTS audio for streaming response
-                # Note: draw_messages() stores the final message in st.session_state.messages
-                # and the container reference in st.session_state.last_message
-                if voice and enable_audio and st.session_state.messages:
-                    last_msg = st.session_state.messages[-1]
-                    # Only generate audio for AI responses with content
-                    if last_msg.type == "ai" and last_msg.content:
-                        # Use audio_only=True since text was already streamed by draw_messages()
-                        voice.render_message(
-                            last_msg.content,
-                            container=st.session_state.last_message,
-                            audio_only=True,
+                thinking_holder = st.empty()
+                thinking_holder.status("Thinking…", state="running", expanded=False)
+                wrapped = _first_event_evict(
+                    _cancellable(stream, STOP_FLAG), thinking_holder
+                )
+                await draw_messages(wrapped, is_new=True)
+                msgs = st.session_state.messages
+                last_ai = msgs[-1] if msgs else None
+                if last_ai and last_ai.type == "ai" and last_ai.content:
+                    try:
+                        await agent_client.atouch_chat(
+                            thread_id=st.session_state.thread_id,
+                            preview=last_ai.content[:120],
                         )
+                    except Exception:
+                        pass
+                cached = st.session_state.chat_meta_cache.get(st.session_state.thread_id)
+                if cached is not None:
+                    cached.updated_at = datetime.now().timestamp()
+                if voice and enable_audio and last_ai and last_ai.type == "ai" and last_ai.content:
+                    voice.render_message(
+                        last_ai.content,
+                        container=st.session_state.last_message,
+                        audio_only=True,
+                    )
             else:
                 response = await agent_client.ainvoke(
-                    message=user_text,
-                    model=model,
+                    message=next_input["text"],
+                    model=next_input["model"],
                     thread_id=st.session_state.thread_id,
                     user_id=user_id,
-                    attachments=attachments,
+                    attachments=next_input["attachments"],
                 )
+                st.session_state.messages.append(response)
                 messages.append(response)
-                # Render AI response with optional voice
                 with st.chat_message("ai"):
                     if voice and enable_audio:
                         voice.render_message(response.content)
                     else:
                         st.write(response.content)
-            st.rerun()  # Clear stale containers
+                try:
+                    await agent_client.atouch_chat(
+                        thread_id=st.session_state.thread_id,
+                        preview=response.content[:120],
+                    )
+                except Exception:
+                    pass
         except AgentClientError as e:
-            st.error(f"Error generating response: {e}")
-            st.stop()
+            st.session_state.error_state = {"error": str(e), "kind": type(e).__name__}
+        finally:
+            st.session_state[ACTIVE_KEY] = None
+            st.session_state[STOP_FLAG] = False
+        st.rerun()
 
-    # If messages have been generated, show feedback widget
     if len(messages) > 0 and st.session_state.last_message:
         with st.session_state.last_message:
             await handle_feedback()
@@ -370,45 +606,19 @@ async def draw_messages(
     messages_agen: AsyncGenerator[ChatMessage | str, None],
     is_new: bool = False,
 ) -> None:
-    """
-    Draws a set of chat messages - either replaying existing messages
-    or streaming new ones.
-
-    This function has additional logic to handle streaming tokens and tool calls.
-    - Use a placeholder container to render streaming tokens as they arrive.
-    - Use a status container to render tool calls. Track the tool inputs and outputs
-      and update the status container accordingly.
-
-    The function also needs to track the last message container in session state
-    since later messages can draw to the same container. This is also used for
-    drawing the feedback widget in the latest chat message.
-
-    Args:
-        messages_aiter: An async iterator over messages to draw.
-        is_new: Whether the messages are new or not.
-    """
-
-    # Keep track of the last message container
     last_message_type = None
     st.session_state.last_message = None
-
-    # Placeholder for intermediate streaming tokens
     streaming_content = ""
     streaming_placeholder = None
 
-    # Iterate over the messages and draw them
     while msg := await anext(messages_agen, None):
-        # str message represents an intermediate token being streamed
         if isinstance(msg, str):
-            # If placeholder is empty, this is the first token of a new message
-            # being streamed. We need to do setup.
             if not streaming_placeholder:
                 if last_message_type != "ai":
                     last_message_type = "ai"
                     st.session_state.last_message = st.chat_message("ai")
                 with st.session_state.last_message:
                     streaming_placeholder = st.empty()
-
             streaming_content += msg
             streaming_placeholder.write(streaming_content)
             continue
@@ -418,26 +628,17 @@ async def draw_messages(
             st.stop()
 
         match msg.type:
-            # A message from the user, the easiest case
             case "human":
                 last_message_type = "human"
                 st.chat_message("human").write(msg.content)
 
-            # A message from the agent is the most complex case, since we need to
-            # handle streaming tokens and tool calls.
             case "ai":
-                # If we're rendering new messages, store the message in session state
                 if is_new:
                     st.session_state.messages.append(msg)
-
-                # If the last message type was not AI, create a new chat message
                 if last_message_type != "ai":
                     last_message_type = "ai"
                     st.session_state.last_message = st.chat_message("ai")
-
                 with st.session_state.last_message:
-                    # If the message has content, write it out.
-                    # Reset the streaming variables to prepare for the next message.
                     if msg.content:
                         if streaming_placeholder:
                             streaming_placeholder.write(msg.content)
@@ -447,57 +648,48 @@ async def draw_messages(
                             st.write(msg.content)
 
                     if msg.tool_calls:
-                        # Create a status container for each tool call and store the
-                        # status container by ID to ensure results are mapped to the
-                        # correct status container.
                         call_results = {}
                         for tool_call in msg.tool_calls:
-                            # Use different labels for transfer vs regular tool calls
                             if "transfer_to" in tool_call["name"]:
                                 label = f"""💼 Sub Agent: {tool_call["name"]}"""
                             else:
                                 label = f"""🛠️ Tool Call: {tool_call["name"]}"""
-
-                            status = st.status(
+                            call_results[tool_call["id"]] = st.status(
                                 label,
                                 state="running" if is_new else "complete",
                             )
-                            call_results[tool_call["id"]] = status
 
-                        # Expect one ToolMessage for each tool call.
                         for tool_call in msg.tool_calls:
                             if "transfer_to" in tool_call["name"]:
                                 status = call_results[tool_call["id"]]
-                                status.update(expanded=True)
-                                await handle_sub_agent_msgs(messages_agen, status, is_new)
+                                with status:
+                                    status.update(expanded=True)
+                                    await handle_sub_agent_msgs(messages_agen, status, is_new)
+                                # Force a new chat_message for the next ai message
+                                # so it renders as a sibling, not a child.
+                                last_message_type = None
                                 break
-
-                            # Only non-transfer tool calls reach this point
                             status = call_results[tool_call["id"]]
-                            status.write("Input:")
-                            status.write(tool_call["args"])
-                            tool_result: ChatMessage = await anext(messages_agen)
-
-                            if tool_result.type != "tool":
-                                st.error(f"Unexpected ChatMessage type: {tool_result.type}")
-                                st.write(tool_result)
-                                st.stop()
-
-                            # Record the message if it's new, and update the correct
-                            # status container with the result
-                            if is_new:
-                                st.session_state.messages.append(tool_result)
-                            if tool_result.tool_call_id:
-                                status = call_results[tool_result.tool_call_id]
-                            status.write("Output:")
-                            status.write(tool_result.content)
-                            status.update(state="complete")
+                            with status:
+                                status.write("Input:")
+                                status.write(tool_call["args"])
+                                tool_result = await anext(messages_agen, None)
+                                if tool_result is None:
+                                    st.error(f"Stream ended before tool {tool_call['name']} returned a result")
+                                    return
+                                if tool_result.type != "tool":
+                                    st.error(f"Unexpected ChatMessage type: {tool_result.type}")
+                                    st.write(tool_result)
+                                    st.stop()
+                                if is_new:
+                                    st.session_state.messages.append(tool_result)
+                                if tool_result.tool_call_id:
+                                    status = call_results[tool_result.tool_call_id]
+                                status.write("Output:")
+                                status.write(tool_result.content)
+                                status.update(state="complete")
 
             case "custom":
-                # CustomData example used by the bg-task-agent
-                # See:
-                # - src/agents/utils.py CustomData
-                # - src/agents/bg_task_agent/task.py
                 try:
                     task_data: TaskData = TaskData.model_validate(msg.custom_data)
                 except ValidationError:
@@ -518,7 +710,6 @@ async def draw_messages(
 
                 status.add_and_draw_task_data(task_data)
 
-            # In case of an unexpected message type, log an error and stop
             case _:
                 st.error(f"Unexpected ChatMessage type: {msg.type}")
                 st.write(msg)
@@ -526,20 +717,12 @@ async def draw_messages(
 
 
 async def handle_feedback() -> None:
-    """Draws a feedback widget and records feedback from the user."""
-
-    # Keep track of last feedback sent to avoid sending duplicates
     if "last_feedback" not in st.session_state:
         st.session_state.last_feedback = (None, None)
-
     latest_run_id = st.session_state.messages[-1].run_id
     feedback = st.feedback("stars", key=latest_run_id)
-
-    # If the feedback value or run ID has changed, send a new feedback record
     if feedback is not None and (latest_run_id, feedback) != st.session_state.last_feedback:
-        # Normalize the feedback value (an index) to a score between 0 and 1
         normalized_score = (feedback + 1) / 5.0
-
         agent_client: AgentClient = st.session_state.agent_client
         try:
             await agent_client.acreate_feedback(
@@ -556,89 +739,55 @@ async def handle_feedback() -> None:
 
 
 async def handle_sub_agent_msgs(messages_agen, status, is_new):
-    """
-    This function segregates agent output into a status container.
-    It handles all messages after the initial tool call message
-    until it reaches the final AI message.
-
-    Enhanced to support nested multi-agent hierarchies with handoff back messages.
-
-    Args:
-        messages_agen: Async generator of messages
-        status: the status container for the current agent
-        is_new: Whether messages are new or replayed
-    """
-    nested_popovers = {}
-
-    # looking for the transfer Success tool call message
-    first_msg = await anext(messages_agen)
+    nested_popovers: dict[str, Any] = {}
+    first_msg = await anext(messages_agen, None)
+    if first_msg is None:
+        return
     if is_new:
         st.session_state.messages.append(first_msg)
-
-    # Continue reading until we get an explicit handoff back
     while True:
-        # Read next message
-        sub_msg = await anext(messages_agen)
-
-        # this should only happen is skip_stream flag is removed
-        # if isinstance(sub_msg, str):
-        #     continue
-
+        sub_msg = await anext(messages_agen, None)
+        if sub_msg is None:
+            return
         if is_new:
             st.session_state.messages.append(sub_msg)
-
-        # Handle tool results with nested popovers
         if sub_msg.type == "tool" and sub_msg.tool_call_id in nested_popovers:
             popover = nested_popovers[sub_msg.tool_call_id]
             popover.write("**Output:**")
             popover.write(sub_msg.content)
             continue
-
-        # Handle transfer_back_to tool calls - these indicate a sub-agent is returning control
         if (
             hasattr(sub_msg, "tool_calls")
             and sub_msg.tool_calls
-            and any("transfer_back_to" in tc.get("name", "") for tc in sub_msg.tool_calls)
+            and "transfer_back_to" in sub_msg.tool_calls[0]["name"]
         ):
-            # Process transfer_back_to tool calls
-            for tc in sub_msg.tool_calls:
-                if "transfer_back_to" in tc.get("name", ""):
-                    # Read the corresponding tool result
-                    transfer_result = await anext(messages_agen)
-                    if is_new:
-                        st.session_state.messages.append(transfer_result)
-
-            # After processing transfer back, we're done with this agent
-            if status:
-                status.update(state="complete")
-            break
-
-        # Display content and tool calls in the same nested status
-        if status:
+            status.write(sub_msg.content)
+            status.update(state="complete")
+            # Consume the matching tool result so it doesn't surface in the
+            # main draw_messages loop as an "Unexpected ChatMessage type: tool".
+            tail = await anext(messages_agen, None)
+            if tail is not None and is_new:
+                st.session_state.messages.append(tail)
+            return
+        if sub_msg.type == "ai":
             if sub_msg.content:
                 status.write(sub_msg.content)
-
-            if hasattr(sub_msg, "tool_calls") and sub_msg.tool_calls:
-                for tc in sub_msg.tool_calls:
-                    # Check if this is a nested transfer/delegate
-                    if "transfer_to" in tc["name"]:
-                        # Create a nested status container for the sub-agent
-                        nested_status = status.status(
-                            f"""💼 Sub Agent: {tc["name"]}""",
-                            state="running" if is_new else "complete",
-                            expanded=True,
-                        )
-
-                        # Recursively handle sub-agents of this sub-agent
-                        await handle_sub_agent_msgs(messages_agen, nested_status, is_new)
-                    else:
-                        # Regular tool call - create popover
-                        popover = status.popover(f"{tc['name']}", icon="🛠️")
-                        popover.write(f"**Tool:** {tc['name']}")
-                        popover.write("**Input:**")
-                        popover.write(tc["args"])
-                        # Store the popover reference using the tool call ID
-                        nested_popovers[tc["id"]] = popover
+            for tool_call in sub_msg.tool_calls or []:
+                if "transfer_to" in tool_call["name"]:
+                    nested_status = status.status(
+                        f"💼 Sub Agent: {tool_call['name']}",
+                        state="running" if is_new else "complete",
+                    )
+                    nested_status.update(expanded=True)
+                    await handle_sub_agent_msgs(messages_agen, nested_status, is_new)
+                    return
+                popover = status.popover(tool_call["name"], icon="🛠️")
+                popover.write(f"**Tool:** {tool_call['name']}")
+                popover.write("**Input:**")
+                popover.json(tool_call["args"])
+                nested_popovers[tool_call["id"]] = popover
+        elif sub_msg.type == "tool":
+            status.write(sub_msg.content)
 
 
 if __name__ == "__main__":

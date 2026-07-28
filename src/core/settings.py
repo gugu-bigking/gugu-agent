@@ -129,6 +129,10 @@ class Settings(BaseSettings):
     )  # Options: DatabaseType.SQLITE or DatabaseType.POSTGRES
     SQLITE_DB_PATH: str = "checkpoints.db"
 
+    # gugu-agent chat metadata store. Separate from the LangGraph checkpointer
+    # so a misbehaving test or migration can't touch conversation state.
+    GUGU_CHAT_META_DB_PATH: str = "chat_meta.db"
+
     # PostgreSQL Configuration
     POSTGRES_USER: str | None = None
     POSTGRES_PASSWORD: SecretStr | None = None

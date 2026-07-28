@@ -29,6 +29,9 @@ from schema import (
     ChatHistory,
     ChatHistoryInput,
     ChatMessage,
+    ChatMetaCreate,
+    ChatMetaItem,
+    ChatMetaUpdate,
     Feedback,
     FeedbackResponse,
     ServiceMetadata,
@@ -36,6 +39,7 @@ from schema import (
     UserInput,
 )
 from service.agui import router as agui_router
+from service.chat_meta import ChatMetaStore
 from service.utils import (
     convert_message_content_to_string,
     ensure_model_available,
@@ -81,6 +85,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             if hasattr(store, "setup"):  # ignore: union-attr
                 await store.setup()
 
+            chat_meta = ChatMetaStore(settings.GUGU_CHAT_META_DB_PATH)
+            await chat_meta.init()
+            app.state.chat_meta_store = chat_meta
+
             if not settings.AUTH_SECRET:
                 logger.warning(
                     "AUTH_SECRET is not configured — all API endpoints are unauthenticated. "
@@ -124,6 +132,75 @@ async def info() -> ServiceMetadata:
         default_agent=DEFAULT_AGENT,
         default_model=settings.DEFAULT_MODEL,
     )
+
+
+@router.get("/gugu/chats", response_model=list[ChatMetaItem], operation_id="list_gugu_chats")
+async def list_gugu_chats(
+    user_id: str,
+    agent: str | None = None,
+) -> list[ChatMetaItem]:
+    """List chat metadata for the sidebar, newest first.
+
+    The list is metadata-only; the messages themselves stay in the
+    LangGraph checkpointer and are fetched on demand via `/history`.
+    """
+    store: ChatMetaStore = app.state.chat_meta_store
+    return await store.list_for_user(user_id=user_id, agent=agent)
+
+
+@router.post(
+    "/gugu/chats",
+    response_model=ChatMetaItem,
+    operation_id="create_gugu_chat",
+)
+async def create_gugu_chat(payload: ChatMetaCreate) -> ChatMetaItem:
+    """Create chat metadata for a brand-new thread.
+
+    The client is responsible for generating the thread_id (so it can
+    pre-seed the URL); the server derives a title from the first
+    message when one isn't provided.
+    """
+    store: ChatMetaStore = app.state.chat_meta_store
+    return await store.create(
+        thread_id=str(uuid4()),
+        user_id=payload.user_id,
+        agent=payload.agent,
+        title=payload.title,
+        first_message=payload.first_message,
+    )
+
+
+@router.patch(
+    "/gugu/chats/{thread_id}",
+    response_model=ChatMetaItem | None,
+    operation_id="update_gugu_chat",
+)
+async def update_gugu_chat(
+    thread_id: str, payload: ChatMetaUpdate
+) -> ChatMetaItem | None:
+    """Update a chat's title and/or preview. Returns 404 if the chat is unknown."""
+    store: ChatMetaStore = app.state.chat_meta_store
+    existing = await store.get(thread_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"Chat {thread_id} not found")
+    return await store.update(
+        thread_id=thread_id,
+        title=payload.title,
+        preview=payload.preview,
+    )
+
+
+@router.post(
+    "/gugu/chats/{thread_id}/touch",
+    response_model=ChatMetaItem | None,
+    operation_id="touch_gugu_chat",
+)
+async def touch_gugu_chat(
+    thread_id: str, preview: str | None = None
+) -> ChatMetaItem | None:
+    """Bump `updated_at` (and optionally preview) after a successful turn."""
+    store: ChatMetaStore = app.state.chat_meta_store
+    return await store.touch(thread_id, preview=preview)
 
 
 async def _handle_input(user_input: UserInput, agent: AgentGraph) -> tuple[dict[str, Any], UUID]:

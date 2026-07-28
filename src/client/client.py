@@ -11,6 +11,8 @@ from schema import (
     ChatHistory,
     ChatHistoryInput,
     ChatMessage,
+    ChatMetaCreate,
+    ChatMetaItem,
     Feedback,
     ServiceMetadata,
     StreamInput,
@@ -33,7 +35,47 @@ class Attachment(TypedDict):
 
 
 class AgentClientError(Exception):
-    pass
+    """Base class for all client-side errors."""
+
+
+class StreamNetworkError(AgentClientError):
+    """The service was unreachable (DNS, refused, disconnect, protocol error)."""
+
+
+class StreamTimeoutError(AgentClientError):
+    """Connect or read timed out before the response completed."""
+
+
+class StreamServerError(AgentClientError):
+    """The service returned a 5xx response."""
+
+
+class StreamClientError(AgentClientError):
+    """The service returned a 4xx response other than auth/not-found/validation."""
+
+
+class StreamInterruptedError(AgentClientError):
+    """The stream ended without the expected [DONE] marker."""
+
+
+def _classify_http_error(e: httpx.HTTPError) -> AgentClientError:
+    if isinstance(e, httpx.TimeoutException):
+        return StreamTimeoutError(f"Request timed out: {e}")
+    if isinstance(e, httpx.ConnectError):
+        return StreamNetworkError(f"Couldn't reach the service: {e}")
+    if isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError)):
+        return StreamInterruptedError(f"Connection interrupted: {e}")
+    if isinstance(e, httpx.HTTPStatusError):
+        status = e.response.status_code
+        body = ""
+        try:
+            body = e.response.text
+        except Exception:  # noqa: BLE001
+            body = ""
+        if status >= 500:
+            return StreamServerError(f"Service error {status}: {body[:200]}")
+        return StreamClientError(f"Request rejected ({status}): {body[:200]}")
+    return AgentClientError(f"HTTP error: {e}")
 
 
 _IMAGE_MIME_PREFIXES = ("image/",)
@@ -378,17 +420,27 @@ class AgentClient:
                     headers=self._headers,
                     timeout=self.timeout,
                 ) as response:
-                    response.raise_for_status()
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPError as e:
+                        raise _classify_http_error(e) from None
+                    saw_done = False
                     async for line in response.aiter_lines():
-                        if line.strip():
-                            parsed = self._parse_stream_line(line)
-                            if parsed is None:
-                                break
-                            # Don't yield empty string tokens as they cause generator issues
-                            if parsed != "":
-                                yield parsed
+                        if not line.strip():
+                            continue
+                        parsed = self._parse_stream_line(line)
+                        if parsed is None:
+                            saw_done = True
+                            break
+                        if parsed == "":
+                            continue
+                        yield parsed
+                    if not saw_done:
+                        raise StreamInterruptedError(
+                            "Stream ended before completion. The service may have restarted."
+                        )
             except httpx.HTTPError as e:
-                raise AgentClientError(f"Error: {e}")
+                raise _classify_http_error(e) from None
 
     async def acreate_feedback(
         self, run_id: str, key: str, score: float, kwargs: dict[str, Any] = {}
@@ -434,6 +486,113 @@ class AgentClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as e:
-            raise AgentClientError(f"Error: {e}")
+            raise _classify_http_error(e) from None
 
         return ChatHistory.model_validate(response.json())
+
+    async def alist_chats(
+        self, user_id: str, agent: str | None = None
+    ) -> list[ChatMetaItem]:
+        """List chat metadata for the sidebar, newest first.
+
+        The list is metadata-only; messages stay in the LangGraph
+        checkpointer and are fetched on demand via get_history.
+        """
+        params: dict[str, str] = {"user_id": user_id}
+        if agent:
+            params["agent"] = agent
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(
+                    f"{self.base_url}/gugu/chats",
+                    params=params,
+                    headers=self._headers,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as e:
+                raise _classify_http_error(e) from None
+        return [ChatMetaItem.model_validate(item) for item in response.json()]
+
+    async def acreate_chat(
+        self,
+        user_id: str,
+        agent: str,
+        first_message: str | None = None,
+        title: str | None = None,
+    ) -> ChatMetaItem:
+        """Register a brand-new chat in the metadata store.
+
+        The server mints the thread_id and returns the persisted row. The
+        client then writes the returned thread_id back into the URL and
+        session state.
+        """
+        payload = ChatMetaCreate(
+            user_id=user_id,
+            agent=agent,
+            title=title,
+            first_message=first_message,
+        )
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    f"{self.base_url}/gugu/chats",
+                    json=payload.model_dump(),
+                    headers=self._headers,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as e:
+                raise _classify_http_error(e) from None
+        return ChatMetaItem.model_validate(response.json())
+
+    async def aupdate_chat(
+        self,
+        thread_id: str,
+        title: str | None = None,
+        preview: str | None = None,
+    ) -> ChatMetaItem:
+        """Update a chat's title and/or preview. Server returns 404 if unknown."""
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if preview is not None:
+            body["preview"] = preview
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.patch(
+                    f"{self.base_url}/gugu/chats/{thread_id}",
+                    json=body,
+                    headers=self._headers,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+            except httpx.HTTPError as e:
+                raise _classify_http_error(e) from None
+        return ChatMetaItem.model_validate(response.json())
+
+    async def atouch_chat(
+        self, thread_id: str, preview: str | None = None
+    ) -> None:
+        """Bump a chat's updated_at (and optionally preview) after a turn.
+
+        Best-effort: 404 and network errors are swallowed so the user
+        flow keeps working even when metadata is out of sync with the
+        LangGraph checkpointer.
+        """
+        params: dict[str, str] = {}
+        if preview is not None:
+            params["preview"] = preview
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    f"{self.base_url}/gugu/chats/{thread_id}/touch",
+                    params=params,
+                    headers=self._headers,
+                    timeout=self.timeout,
+                )
+                if response.status_code == 404:
+                    return
+                response.raise_for_status()
+            except httpx.HTTPError:
+                return

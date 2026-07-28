@@ -201,3 +201,40 @@ class ChatHistoryInput(BaseModel):
 
 class ChatHistory(BaseModel):
     messages: list[ChatMessage]
+
+
+class ChatMetaItem(BaseModel):
+    """Lightweight metadata about a chat thread.
+
+    Messages live in the LangGraph checkpointer; this record only stores
+    enough to render a sidebar list and to remember the user's title.
+    """
+
+    thread_id: str = Field(
+        description="Thread ID of the chat (same as the LangGraph thread id).",
+    )
+    user_id: str = Field(description="Owner of the chat.")
+    agent: str = Field(description="Agent key this chat belongs to.")
+    title: str = Field(description="Display title shown in the sidebar.")
+    preview: str = Field(
+        description="Short excerpt of the most recent exchange.",
+        default="",
+    )
+    created_at: float = Field(description="Unix epoch seconds.")
+    updated_at: float = Field(description="Unix epoch seconds.")
+
+
+class ChatMetaCreate(BaseModel):
+    """Request to register a new chat in the metadata store."""
+
+    user_id: str
+    agent: str
+    title: str | None = None
+    first_message: str | None = None
+
+
+class ChatMetaUpdate(BaseModel):
+    """Partial update for chat metadata."""
+
+    title: str | None = None
+    preview: str | None = None

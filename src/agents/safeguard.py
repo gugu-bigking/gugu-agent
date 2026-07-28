@@ -100,9 +100,22 @@ class Safeguard:
 
     def _compile_messages(self, messages: list[AnyMessage]) -> list[AnyMessage]:
         role_mapping = {"ai": "Agent", "human": "User"}
-        # Create a formatted history string to evaluate
+
+        def _text_only(content) -> str:
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return " ".join(
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            return str(content)
+
         messages_str = [
-            f"{role_mapping[m.type]}: {m.content}" for m in messages if m.type in ["ai", "human"]
+            f"{role_mapping[m.type]}: {_text_only(m.content)}"
+            for m in messages
+            if m.type in ["ai", "human"]
         ]
         conversation_history = "\n\n".join(messages_str)
         user_message_content = f"Content to classify: {conversation_history}\nAnswer (JSON only):"

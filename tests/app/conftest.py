@@ -26,6 +26,33 @@ def mock_agent_client(mock_env):
     ):
         mock_agent_client_instance = mock_agent_client.return_value
         mock_agent_client_instance.info = mock_info
-        # Give the mock a deterministic selected agent.
         mock_agent_client_instance.agent = "test-agent"
+        # Chat list endpoints are new — default the mocks to empty results
+        # so the sidebar doesn't blow up in tests that don't care.
+        mock_agent_client_instance.alist_chats = _empty_chat_list
+        mock_agent_client_instance.acreate_chat = _echo_chat
+        mock_agent_client_instance.aupdate_chat = _echo_chat
+        mock_agent_client_instance.atouch_chat = _no_op
         yield mock_agent_client_instance
+
+
+async def _empty_chat_list(*args, **kwargs):
+    return []
+
+
+async def _echo_chat(*args, **kwargs):
+    from schema import ChatMetaItem
+
+    return ChatMetaItem(
+        thread_id=kwargs.get("thread_id", "test-thread"),
+        user_id=kwargs.get("user_id", "test-user"),
+        agent=kwargs.get("agent", "test-agent"),
+        title="Mocked chat",
+        preview="",
+        created_at=0.0,
+        updated_at=0.0,
+    )
+
+
+async def _no_op(*args, **kwargs):
+    return None

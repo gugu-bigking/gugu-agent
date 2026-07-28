@@ -68,6 +68,7 @@ def test_app_settings(mock_agent_client):
         model=OpenAIModelName.GPT_5_MINI,
         thread_id=at.session_state.thread_id,
         user_id="1234",
+        attachments=None,
     )
     assert not at.exception
 
@@ -167,6 +168,61 @@ async def test_app_streaming(mock_agent_client):
 
 
 @pytest.mark.asyncio
+async def test_app_streaming_multiple_tool_calls(mock_agent_client):
+    """Regression: an ai message with multiple tool_calls must not be
+    processed twice — the second pass used to consume the trailing ai
+    message as a fake "tool result" and st.stop() the app.
+    """
+    at = AppTest.from_file("../../src/streamlit_app.py").run()
+
+    PROMPT = "Compute two things"
+    ai_two_tools = ChatMessage(
+        type="ai",
+        content="",
+        tool_calls=[
+            {"name": "calculator", "id": "call-1", "args": {"expression": "6 * 7"}},
+            {"name": "search", "id": "call-2", "args": {"query": "weather"}},
+        ],
+    )
+    tool_result_1 = ChatMessage(type="tool", content="42", tool_call_id="call-1")
+    tool_result_2 = ChatMessage(type="tool", content="Sunny", tool_call_id="call-2")
+    final_ai_message = ChatMessage(type="ai", content="6*7=42 and weather is Sunny")
+
+    messages = [ai_two_tools, tool_result_1, tool_result_2, final_ai_message]
+
+    async def amessage_iter() -> AsyncGenerator[ChatMessage, None]:
+        for m in messages:
+            yield m
+
+    mock_agent_client.astream = Mock(return_value=amessage_iter())
+
+    at.toggle[0].set_value(True)
+    at.chat_input[0].set_value(PROMPT).run()
+    print(at)
+
+    response = at.chat_message[1]
+    assert response.avatar == "assistant"
+    # Each tool call renders its own status, in order.
+    assert len(response.status) == 2, (
+        f"Expected 2 tool statuses, got {len(response.status)}"
+    )
+    tool_status_1 = response.status[0]
+    tool_status_2 = response.status[1]
+    assert tool_status_1.label == "🛠️ Tool Call: calculator"
+    assert tool_status_1.icon == ":material/check:"
+    assert tool_status_1.markdown[0].value == "Input:"
+    assert tool_status_1.json[0].value == '{"expression": "6 * 7"}'
+    assert tool_status_1.markdown[1].value == "Output:"
+    assert tool_status_1.markdown[2].value == "42"
+    assert tool_status_2.label == "🛠️ Tool Call: search"
+    assert tool_status_2.json[0].value == '{"query": "weather"}'
+    assert tool_status_2.markdown[2].value == "Sunny"
+    # Final ai content must surface, not be swallowed as a tool result.
+    assert response.markdown[-1].value == "6*7=42 and weather is Sunny"
+    assert not at.exception
+
+
+@pytest.mark.asyncio
 async def test_app_init_error(mock_agent_client):
     """Test the app with an error in the agent initialization"""
     at = AppTest.from_file("../../src/streamlit_app.py").run()
@@ -179,9 +235,10 @@ async def test_app_init_error(mock_agent_client):
     at.chat_input[0].set_value(PROMPT).run()
     print(at)
 
-    assert at.chat_message[0].avatar == "assistant"
-    assert at.chat_message[1].avatar == "user"
-    assert at.chat_message[1].markdown[0].value == PROMPT
+    # Welcome banner from the initial run is replaced by the user prompt
+    # once messages is non-empty; what matters here is the error banner.
+    assert at.chat_message[0].avatar == "user"
+    assert at.chat_message[0].markdown[0].value == PROMPT
     assert at.error[0].value == "Error generating response: Error connecting to agent"
     assert not at.exception
 

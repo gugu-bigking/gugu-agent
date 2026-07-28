@@ -1,4 +1,5 @@
 import os
+import tempfile
 from unittest.mock import patch
 
 import pytest
@@ -24,6 +25,18 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture
 def mock_env():
-    """Fixture to ensure environment is clean for each test."""
-    with patch.dict(os.environ, {}, clear=True):
-        yield
+    """Clear app-specific env while keeping a usable home directory.
+
+    Streamlit's runtime reads `Path.home()` from a side thread on first
+    import, and a few tests (notably AppTest) need it to resolve. We keep
+    `USERPROFILE`/`HOME` pointing at a temp dir so the AppTest script
+    runner can start; everything else is wiped so tests stay hermetic.
+    """
+    with tempfile.TemporaryDirectory() as home:
+        preserved = {"USERPROFILE": home, "HOME": home, "HOMEDRIVE": "C:"}
+        with patch.dict(
+            os.environ,
+            {k: v for k, v in os.environ.items() if k not in preserved} | preserved,
+            clear=True,
+        ):
+            yield

@@ -5,12 +5,14 @@ to the model up-front. Local tools (hybrid_search, web_search) are always
 present; MCP tools are appended when their env credentials are configured.
 """
 
+import asyncio
+import base64
 import logging
 from datetime import datetime
 from typing import Literal
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import (
     RunnableConfig,
     RunnableLambda,
@@ -26,7 +28,13 @@ from langgraph.prebuilt import ToolNode
 from agents.lazy_agent import LazyLoadingAgent
 from agents.rag_tools import hybrid_search
 from agents.safeguard import Safeguard, SafeguardOutput, SafetyAssessment
-from agents.tools import understand_document, understand_image, web_search
+from agents.tools import (
+    understand_document,
+    understand_document_func,
+    understand_image,
+    understand_image_func,
+    web_search,
+)
 from core import get_model, settings
 
 logger = logging.getLogger(__name__)
@@ -131,6 +139,162 @@ async def _load_mcp_tools() -> list[BaseTool]:
         return []
 
 
+# Inline base64 images larger than this get pre-described via `understand_image`
+# and replaced with text in the message history. The 500 KB threshold catches
+# screenshots and high-resolution photos that bloat prompts and occasionally
+# trigger upstream content moderation, while leaving small icons/thumbnails
+# alone so vision-capable models still see them directly.
+_LARGE_IMAGE_B64_BYTES = 500 * 1024
+
+# Tool retry policy for transient failures (network resets, empty MCP errors,
+# brief TLS hiccups). Non-transient errors propagate immediately.
+_TOOL_RETRY_ATTEMPTS = 3
+_TOOL_RETRY_BASE_DELAY_S = 1.0
+
+
+def _parse_data_url(url: str) -> tuple[str | None, str | None]:
+    """Return (mime_type, base64_payload) for a data: URL, else (None, None)."""
+    if not url.startswith("data:"):
+        return None, None
+    head, _, payload = url.partition(",")
+    # `data:image/png;base64,iVBOR...`
+    meta = head[len("data:"):]  # "image/png;base64"
+    parts = meta.split(";")
+    mime = parts[0] if parts else ""
+    if "base64" not in parts:
+        return mime or None, None
+    return mime or None, payload
+
+
+async def _describe_image_block(b64: str, mime: str) -> str:
+    """Run `understand_image` in a worker thread (the SDK is sync)."""
+    return await asyncio.to_thread(
+        understand_image_func, b64, mime, "Describe this image concisely."
+    )
+
+
+async def _resolve_attachments(state: AgentState) -> AgentState:
+    """Pre-process large image/file attachments in the newest human message.
+
+    Anthropic's content moderation occasionally rejects prompts containing
+    large inline base64 images, which is the dominant failure mode in
+    LangSmith. Stripping the bytes and replacing them with a text description
+    keeps the LLM informed while keeping the prompt small.
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+    last = messages[-1]
+    if not isinstance(last, HumanMessage):
+        return {}
+    content = last.content
+    if not isinstance(content, list):
+        return {}
+
+    new_blocks: list = []
+    changed = False
+
+    for block in content:
+        if not isinstance(block, dict):
+            new_blocks.append(block)
+            continue
+
+        btype = block.get("type")
+
+        if btype == "image_url":
+            url = (block.get("image_url") or {}).get("url", "")
+            mime, b64 = _parse_data_url(url)
+            if mime and b64 and len(b64) > _LARGE_IMAGE_B64_BYTES:
+                try:
+                    desc = await _describe_image_block(b64, mime)
+                except Exception as e:
+                    logger.warning(
+                        "understand_image failed, keeping original block: %s", e
+                    )
+                    new_blocks.append(block)
+                    continue
+                new_blocks.append(
+                    {"type": "text", "text": f"[Attached image]\n{desc}"}
+                )
+                changed = True
+                continue
+            new_blocks.append(block)
+
+        elif btype == "file":
+            file_meta = block.get("file") or {}
+            filename = file_meta.get("filename", "uploaded")
+            b64 = file_meta.get("data_b64", "")
+            if b64:
+                try:
+                    text = await asyncio.to_thread(
+                        understand_document_func, b64, filename
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "understand_document failed, keeping original block: %s", e
+                    )
+                    new_blocks.append(block)
+                    continue
+                new_blocks.append(
+                    {"type": "text", "text": f"[Attached file: {filename}]\n{text}"}
+                )
+                changed = True
+                continue
+            new_blocks.append(block)
+
+        else:
+            new_blocks.append(block)
+
+    if not changed:
+        return {}
+
+    return {"messages": [HumanMessage(content=new_blocks, id=last.id)]}
+
+
+def _is_transient_tool_error(exc: BaseException) -> bool:
+    """Heuristic: which tool errors are worth retrying."""
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    name = type(exc).__name__
+    msg = str(exc).strip().lower()
+    if name == "McpError" and not msg:
+        # Empty MCP errors are almost always a connection/TLS hiccup that
+        # the upstream library surfaced as "".
+        return True
+    if "ssl" in msg or "reset" in msg or "eof" in msg or "timed out" in msg:
+        return True
+    return False
+
+
+class RetryingToolNode:
+    """Drop-in replacement for `ToolNode` with transient-error retry."""
+
+    def __init__(self, tools: list[BaseTool], attempts: int = _TOOL_RETRY_ATTEMPTS) -> None:
+        self._node = ToolNode(tools)
+        self._attempts = attempts
+
+    async def __call__(self, state: AgentState, config: RunnableConfig | None = None) -> AgentState:
+        last: BaseException | None = None
+        for i in range(self._attempts):
+            try:
+                return await self._node.ainvoke(state, config)  # type: ignore[arg-type]
+            except Exception as e:
+                last = e
+                if not _is_transient_tool_error(e) or i == self._attempts - 1:
+                    break
+                wait = _TOOL_RETRY_BASE_DELAY_S * (2 ** i)
+                logger.warning(
+                    "tool_node retry %d/%d after %.1fs: %s",
+                    i + 1,
+                    self._attempts,
+                    wait,
+                    e,
+                )
+                await asyncio.sleep(wait)
+        assert last is not None
+        raise last
+
+
 class GuguAgent(LazyLoadingAgent):
     """Gugu agent with async MCP tool loading."""
 
@@ -149,7 +313,7 @@ class GuguAgent(LazyLoadingAgent):
 
 def _build_graph(bound_tools: list[BaseTool]):
     instructions = _build_instructions()
-    tool_node = ToolNode(bound_tools)
+    tool_node = RetryingToolNode(bound_tools)
 
     def wrap_model(model: BaseChatModel) -> RunnableSerializable[AgentState, AIMessage]:
         bound = model.bind_tools(bound_tools)
@@ -204,7 +368,9 @@ def _build_graph(bound_tools: list[BaseTool]):
     graph.add_node("tools", tool_node)
     graph.add_node("guard_input", safeguard_input)
     graph.add_node("block_unsafe_content", block_unsafe_content)
-    graph.set_entry_point("guard_input")
+    graph.add_node("resolve_attachments", _resolve_attachments)
+    graph.set_entry_point("resolve_attachments")
+    graph.add_edge("resolve_attachments", "guard_input")
 
     graph.add_conditional_edges(
         "guard_input", check_safety, {"unsafe": "block_unsafe_content", "safe": "model"}
