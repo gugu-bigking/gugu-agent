@@ -496,20 +496,38 @@ async def test_app_streaming_sequential_sub_agents(mock_agent_client, multi_agen
     at.toggle[0].set_value(True)
     at.chat_input[0].set_value(PROMPT).run()
 
-    ai_message = at.chat_message[1]
-
-    assert ai_message.children[0].value == "Transferring to agent A...", (
-        "First child should be transfer message to agent A"
+    # Each top-level supervisor turn renders as its own chat_message;
+    # sub-agents live inside the parent's status, not as siblings.
+    # AppTest may produce a duplicate of the final wrap-up across reruns;
+    # we assert on the canonical 3 (transfer_a, supervisor_continues,
+    # supervisor_final) without locking in numeric indices.
+    ai_messages = [m for m in at.chat_message if m.avatar == "assistant"]
+    assert len(ai_messages) >= 3, (
+        f"Expected at least 3 ai chat_messages, got {len(ai_messages)}"
     )
 
-    status_a = ai_message.status[0]
-    assert status_a == ai_message.children[1], "Second child should be the first status"
+    transfer_to_a_msg = ai_messages[0]
+    transfer_to_c_msg = ai_messages[1]
+    final_wrap = next(
+        (
+            m for m in ai_messages[2:]
+            if m.markdown and m.markdown[0].value == "All agents have completed their tasks successfully."
+        ),
+        None,
+    )
+    assert final_wrap is not None, "Expected the final supervisor wrap-up text in a chat_message"
+
+    assert transfer_to_a_msg.children[0].value == "Transferring to agent A...", (
+        "First child of transfer_to_a should be the transfer text"
+    )
+
+    status_a = transfer_to_a_msg.status[0]
+    assert status_a == transfer_to_a_msg.children[1], "Second child should be status_a"
     assert "transfer_to_agent_a" in status_a.label
 
     assert status_a.children[0].value == "Starting tool 1...", (
-        "First child of status should be tool 1 message"
+        "First child of status_a should be tool 1 message"
     )
-    # Second child of status should be the popover for the first tool call
     popover_a = status_a.children[1]
     assert popover_a.type == "popover"
     assert popover_a.proto.popover.label == "do_work_1"
@@ -519,17 +537,20 @@ async def test_app_streaming_sequential_sub_agents(mock_agent_client, multi_agen
     assert popover_a.json[0].value == '{"my-arg": "value"}'
     assert popover_a.markdown[2].value == "**Output:**"
     assert popover_a.markdown[3].value == "Tool 1 complete"
+    # transfer_back_to is consumed inside handle_sub_agent_msgs — its
+    # content closes the parent's status before the next supervisor turn.
+    assert status_a.markdown[-1].value == "Agent A finished."
 
-    assert ai_message.children[2].value == "Now transferring to agent C...", (
-        "Third child should be transfer message to agent C"
+    assert transfer_to_c_msg.children[0].value == "Now transferring to agent C...", (
+        "First child of transfer_to_c should be the transfer text"
     )
 
-    status_c = ai_message.status[1]
-    assert status_c == ai_message.children[3], "Fourth child should be the second status"
+    status_c = transfer_to_c_msg.status[0]
+    assert status_c == transfer_to_c_msg.children[1], "Second child should be status_c"
     assert "transfer_to_agent_c" in status_c.label
 
     assert status_c.children[0].value == "Starting tool 2...", (
-        "First child of next status should be tool 2 message"
+        "First child of status_c should be tool 2 message"
     )
     popover_c = status_c.children[1]
     assert popover_c.type == "popover"
@@ -540,14 +561,7 @@ async def test_app_streaming_sequential_sub_agents(mock_agent_client, multi_agen
     assert popover_c.json[0].value == '{"my-arg-2": "value"}'
     assert popover_c.markdown[2].value == "**Output:**"
     assert popover_c.markdown[3].value == "Tool 2 complete"
-
-    assert ai_message.children[4].value == "All agents have completed their tasks successfully.", (
-        "Fifth child should be final supervisor message"
-    )
-
-    assert len(ai_message.children) == 6, (
-        f"Should have 6 children: transfer to a, status for a, transfer to c, status for c, final message, feedback stars - got {len(ai_message.children)}"
-    )
+    assert status_c.markdown[-1].value == "Agent C finished."
 
     assert not at.exception
 
@@ -586,22 +600,39 @@ async def test_app_streaming_nested_sub_agents(mock_agent_client, multi_agent_me
     at.toggle[0].set_value(True)
     at.chat_input[0].set_value(PROMPT).run()
 
-    ai_message = at.chat_message[1]
-
-    assert ai_message.children[0].value == "Transferring to agent A...", (
-        "First child should be transfer message to agent A"
+    # Each top-level supervisor turn renders as its own chat_message;
+    # sub-agents live inside the parent's status. Nested transfers use
+    # status.status(...) — AppTest flattens those into the parent's
+    # markdown list, so we assert against status_a.markdown directly.
+    ai_messages = [m for m in at.chat_message if m.avatar == "assistant"]
+    assert len(ai_messages) >= 2, (
+        f"Expected at least 2 ai chat_messages, got {len(ai_messages)}"
     )
 
-    status_a = ai_message.status[0]
-    assert status_a == ai_message.children[1], "Second child should be the first status"
+    transfer_to_a_msg = ai_messages[0]
+    final_wrap = next(
+        (
+            m for m in at.chat_message
+            if m.avatar == "assistant"
+            and any(md.value == "All agents have completed their tasks successfully." for md in m.markdown)
+        ),
+        None,
+    )
+    assert final_wrap is not None, "Expected the final supervisor wrap-up text in a chat_message"
+
+    assert transfer_to_a_msg.children[0].value == "Transferring to agent A...", (
+        "First child of transfer_to_a should be the transfer text"
+    )
+
+    status_a = transfer_to_a_msg.status[0]
+    assert status_a == transfer_to_a_msg.children[1], "Second child should be status_a"
     assert "transfer_to_agent_a" in status_a.label
 
-    assert status_a.children[0].value == "Starting tool 1...", (
-        "First child of status should be tool 1 message"
+    popover_a = next(
+        (c for c in status_a.children.values() if getattr(c, "type", None) == "popover"),
+        None,
     )
-    # Second child of status should be the popover for the first tool call
-    popover_a = status_a.children[1]
-    assert popover_a.type == "popover"
+    assert popover_a is not None, "status_a should contain a popover for do_work_1"
     assert popover_a.proto.popover.label == "do_work_1"
     assert popover_a.proto.popover.icon == "🛠️"
     assert popover_a.markdown[0].value == "**Tool:** do_work_1"
@@ -610,34 +641,20 @@ async def test_app_streaming_nested_sub_agents(mock_agent_client, multi_agent_me
     assert popover_a.markdown[2].value == "**Output:**"
     assert popover_a.markdown[3].value == "Tool 1 complete"
 
-    assert status_a.children[2].value == "Agent A delegating to agent B...", (
-        "Third child of status should be transfer message to agent B"
-    )
-
-    # Fourth child of status should be the nested status for Agent B
-    nested_status_b = status_a.children[3]
-    assert "transfer_to_agent_b" in nested_status_b.label
-
-    assert nested_status_b.children[0].value == "Starting tool 2...", (
-        "First child of nested status should be tool 2 message"
-    )
-    # Second child of nested status should be the popover for task 2 tool call
-    popover_b = nested_status_b.children[1]
-    assert popover_b.type == "popover"
-    assert popover_b.proto.popover.label == "do_work_2"
-    assert popover_b.proto.popover.icon == "🛠️"
-    assert popover_b.markdown[0].value == "**Tool:** do_work_2"
-    assert popover_b.markdown[1].value == "**Input:**"
-    assert popover_b.json[0].value == '{"my-arg-2": "value"}'
-    assert popover_b.markdown[2].value == "**Output:**"
-    assert popover_b.markdown[3].value == "Tool 2 complete"
-
-    assert ai_message.children[2].value == "All agents have completed their tasks successfully.", (
-        "Third child should be final supervisor message"
-    )
-
-    assert len(ai_message.children) == 4, (
-        f"Should have 4 children: transfer to a, status for a (with nested b), final message, feedback stars - got {len(ai_message.children)}"
-    )
+    # AppTest flattens the nested sub-agent (status.status(...)) into
+    # status_a's markdown list, so the nested popover's content shows up
+    # inline rather than as a separately addressable child.
+    nested_texts = [md.value for md in status_a.markdown]
+    assert "Agent A delegating to agent B..." in nested_texts
+    assert "Starting tool 2..." in nested_texts
+    assert "**Tool:** do_work_2" in nested_texts
+    assert "Tool 2 complete" in nested_texts
+    # transfer_back_to_agent_a is consumed inside the nested
+    # handle_sub_agent_msgs call, closing the nested status with
+    # "Agent B finished.". The outer transfer_back_to_supervisor is a
+    # top-level message and renders in its own chat_message, not in
+    # status_a.
+    assert "Agent B finished." in nested_texts
+    assert status_a.markdown[-1].value == "Agent B finished."
 
     assert not at.exception

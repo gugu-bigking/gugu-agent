@@ -76,6 +76,14 @@ def _build_attachments(uploaded_files) -> list[Attachment]:
     return attachments
 
 
+def _is_sub_agent_call(tool_name: str) -> bool:
+    """A tool call hands off to a sub-agent only if it really hands off —
+    not if it's a `transfer_back_to_*` return, which starts with
+    `transfer_back_to_` (no leading `transfer_to_`).
+    """
+    return tool_name.startswith("transfer_to_") and not tool_name.startswith("transfer_back_to_")
+
+
 def get_or_create_user_id() -> str:
     if USER_ID_COOKIE in st.session_state:
         return st.session_state[USER_ID_COOKIE]
@@ -119,6 +127,8 @@ def _ensure_state() -> None:
         "chat_meta_loaded_for": None,
         "last_attachment_meta": [],
         "last_message": None,
+        "pending_attachments": [],
+        "pending_attachment_names": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -441,7 +451,7 @@ async def main() -> None:
             st.write(WELCOME)
 
     async def amessage_iter() -> AsyncGenerator[ChatMessage, None]:
-        for m in messages:
+        for m in st.session_state.messages or []:
             yield m
 
     await draw_messages(amessage_iter())
@@ -451,8 +461,8 @@ async def main() -> None:
         and enable_audio
         and "last_audio" in st.session_state
         and st.session_state.last_message
-        and len(messages) > 0
-        and messages[-1].type == "ai"
+        and st.session_state.messages
+        and st.session_state.messages[-1].type == "ai"
     ):
         with st.session_state.last_message:
             audio_data = st.session_state.last_audio
@@ -491,11 +501,23 @@ async def main() -> None:
     uploaded_files = chat_input["files"] if chat_input else []
 
     if chat_input and uploaded_files and not user_text.strip():
-        st.toast("请输入文字后再发送附件", icon="⚠️")
+        # Stash bytes so they survive the chat_input widget clearing; user
+        # can type a message and submit to send them along together.
+        st.session_state.pending_attachments = _build_attachments(uploaded_files)
+        st.session_state.pending_attachment_names = [f.name for f in uploaded_files]
+        st.toast("附件已暂存，请输入文字后再发送", icon="📎")
         chat_input = None
+        st.rerun()
+        return
+
+    if st.session_state.get("pending_attachment_names"):
+        st.caption("📎 暂存附件：" + " · ".join(st.session_state.pending_attachment_names))
 
     if chat_input:
-        attachments = _build_attachments(uploaded_files) if uploaded_files else None
+        pending = st.session_state.pop("pending_attachments", [])
+        st.session_state.pop("pending_attachment_names", None)
+        uploaded_atts = _build_attachments(uploaded_files) if uploaded_files else []
+        attachments = uploaded_atts + pending or None
         display_text = user_text or "(attached file)"
         new_input = {
             "text": user_text,
@@ -506,7 +528,9 @@ async def main() -> None:
         human_msg = ChatMessage(type="human", content=display_text)
         st.session_state.messages.append(human_msg)
         st.session_state.last_user_input = new_input
-        st.session_state.last_attachment_meta = [a.name for a in (uploaded_files or [])]
+        st.session_state.last_attachment_meta = [
+            a["filename"] for a in (uploaded_atts or pending or [])
+        ]
         st.session_state.pending_messages.append(new_input)
         st.rerun()
 
@@ -548,7 +572,12 @@ async def main() -> None:
                 wrapped = _first_event_evict(
                     _cancellable(stream, STOP_FLAG), thinking_holder
                 )
+                pre_run_len = len(st.session_state.messages)
                 await draw_messages(wrapped, is_new=True)
+                if st.session_state[STOP_FLAG]:
+                    st.session_state.messages = st.session_state.messages[:pre_run_len]
+                    st.session_state.pop("last_audio", None)
+                    st.session_state.last_user_input = None
                 msgs = st.session_state.messages
                 last_ai = msgs[-1] if msgs else None
                 if last_ai and last_ai.type == "ai" and last_ai.content:
@@ -650,7 +679,7 @@ async def draw_messages(
                     if msg.tool_calls:
                         call_results = {}
                         for tool_call in msg.tool_calls:
-                            if "transfer_to" in tool_call["name"]:
+                            if _is_sub_agent_call(tool_call["name"]):
                                 label = f"""💼 Sub Agent: {tool_call["name"]}"""
                             else:
                                 label = f"""🛠️ Tool Call: {tool_call["name"]}"""
@@ -660,7 +689,7 @@ async def draw_messages(
                             )
 
                         for tool_call in msg.tool_calls:
-                            if "transfer_to" in tool_call["name"]:
+                            if _is_sub_agent_call(tool_call["name"]):
                                 status = call_results[tool_call["id"]]
                                 with status:
                                     status.update(expanded=True)
@@ -719,7 +748,10 @@ async def draw_messages(
 async def handle_feedback() -> None:
     if "last_feedback" not in st.session_state:
         st.session_state.last_feedback = (None, None)
-    latest_run_id = st.session_state.messages[-1].run_id
+    messages = st.session_state.messages or []
+    latest_run_id = messages[-1].run_id if messages else None
+    if not latest_run_id:
+        return
     feedback = st.feedback("stars", key=latest_run_id)
     if feedback is not None and (latest_run_id, feedback) != st.session_state.last_feedback:
         normalized_score = (feedback + 1) / 5.0
@@ -773,7 +805,7 @@ async def handle_sub_agent_msgs(messages_agen, status, is_new):
             if sub_msg.content:
                 status.write(sub_msg.content)
             for tool_call in sub_msg.tool_calls or []:
-                if "transfer_to" in tool_call["name"]:
+                if _is_sub_agent_call(tool_call["name"]):
                     nested_status = status.status(
                         f"💼 Sub Agent: {tool_call['name']}",
                         state="running" if is_new else "complete",
